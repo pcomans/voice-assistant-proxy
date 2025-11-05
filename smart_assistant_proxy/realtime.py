@@ -117,13 +117,13 @@ class RealtimeProxy:
                 "type": "session.update",
                 "session": {
                     "modalities": ["text", "audio"],
-                    "instructions": "You are a helpful voice assistant. Keep ALL responses under 10 seconds of audio. Be extremely concise - use 1-2 sentences maximum.",
+                    "instructions": "You are a helpful voice assistant. Be concise but complete.",
                     "voice": "alloy",
                     "input_audio_format": "pcm16",
                     "output_audio_format": "pcm16",  # OpenAI only supports pcm16, g711_ulaw, g711_alaw
                     "input_audio_transcription": {"model": "whisper-1"},
                     "turn_detection": None,  # Disable server VAD, we handle turn detection on device
-                    "max_response_output_tokens": 100,  # Limit response length
+                    "max_response_output_tokens": 500,  # Allow complete sentences (~2-3 sentences)
                 },
             }
             await ws.send(json.dumps(session_update))
