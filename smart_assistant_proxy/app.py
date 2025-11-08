@@ -2,6 +2,7 @@ import json
 import logging
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, constr
 
 from .config import Settings, get_settings
@@ -25,12 +26,18 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/audio")
+@app.post("/v1/audio", response_model=None)
 async def post_audio(
     chunk: AudioChunk,
     x_assistant_token: str = Header(..., alias="X-Assistant-Token"),
     settings: Settings = Depends(get_settings),
-) -> dict[str, str]:
+):
+    """
+    Process audio chunk with streaming support (Option C).
+
+    Non-final chunks: Returns {"status": "partial"} immediately
+    Final chunk: Returns StreamingResponse with newline-delimited JSON audio chunks
+    """
     if x_assistant_token != settings.assistant_shared_secret:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
 
@@ -53,32 +60,23 @@ async def post_audio(
         logger.exception("Proxy ingest failed for session=%s index=%d", chunk.session_id, chunk.chunk_index)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="proxy_ingest_failed") from exc
 
-    # Enforce 4MB response size limit to match client constraints
-    MAX_RESPONSE_SIZE = 4 * 1024 * 1024  # 4MB
-    try:
-        response_json = json.dumps(result, separators=(",", ":"), ensure_ascii=False)
-        response_len = len(response_json)
-    except (TypeError, ValueError) as exc:
-        logger.warning("Failed to serialize proxy response for session=%s: %s", chunk.session_id, exc)
-        response_len = -1
-        response_json = None
-
-    if response_json and response_len >= MAX_RESPONSE_SIZE:
-        logger.error(
-            "Response exceeds 4MB limit session=%s body_bytes=%d",
-            chunk.session_id,
-            response_len,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"response_too_large: {response_len} bytes exceeds 4MB limit",
+    # Check if result is an async generator (final chunk streaming response)
+    if hasattr(result, '__anext__'):  # It's an async generator
+        logger.info("Returning streaming response session=%s", chunk.session_id)
+        return StreamingResponse(
+            result,
+            media_type="application/x-ndjson",  # Newline-delimited JSON
+            headers={
+                "X-Session-ID": chunk.session_id,
+                "Cache-Control": "no-cache",
+            }
         )
 
+    # Non-final chunk - return dict immediately
     logger.info(
-        "Returning response session=%s status=%s body_bytes=%d",
+        "Returning ack session=%s status=%s",
         chunk.session_id,
         result.get("status"),
-        response_len,
     )
 
     return result
