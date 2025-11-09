@@ -17,7 +17,7 @@ async def test_streaming_response_with_real_audio(client, auth_headers, real_aud
     This is an integration test that:
     1. Sends real audio to the proxy
     2. Verifies streaming response format
-    3. Collects Opus-encoded audio chunks
+    3. Collects PCM16 audio chunks (24kHz mono)
     4. Validates response completeness
 
     Run with: pytest -v -m integration --run-integration
@@ -62,8 +62,8 @@ async def test_streaming_response_with_real_audio(client, auth_headers, real_aud
 
                 if "audio_delta" in data:
                     audio_chunks += 1
-                    opus_bytes = base64.b64decode(data["audio_delta"])
-                    total_audio_bytes += len(opus_bytes)
+                    pcm_bytes = base64.b64decode(data["audio_delta"])
+                    total_audio_bytes += len(pcm_bytes)
 
                 elif "status" in data:
                     status_chunks += 1

@@ -163,22 +163,28 @@ async def test_streaming_proxy(
                         print(f"   Upload time: {(first_chunk_time - start_time)*1000:.0f}ms")
                         print(f"   Response chunks: {len(response_chunks)}")
 
-                        # Decode and save audio
+                        # Decode and save audio as WAV
                         if response_chunks:
                             # Decode each chunk's base64 separately, then join the bytes
-                            audio_bytes = b"".join(
+                            pcm_bytes = b"".join(
                                 base64.b64decode(c.get("audio_delta", ""))
                                 for c in response_chunks
                                 if c.get("audio_delta")
                             )
 
-                            if audio_bytes:
+                            if pcm_bytes:
+                                # Save as WAV file (24kHz, mono, 16-bit PCM)
+                                output_file = "response.wav"
+                                with wave.open(output_file, 'wb') as wf:
+                                    wf.setnchannels(1)  # Mono
+                                    wf.setsampwidth(2)  # 16-bit = 2 bytes
+                                    wf.setframerate(24000)  # 24kHz
+                                    wf.writeframes(pcm_bytes)
 
-                                output_file = "response.opus"
-                                with open(output_file, "wb") as f:
-                                    f.write(audio_bytes)
-
-                                print(f"   Response size: {len(audio_bytes):,} bytes")
+                                duration = len(pcm_bytes) / (24000 * 2)  # bytes / (sample_rate * bytes_per_sample)
+                                print(f"   Response size: {len(pcm_bytes):,} bytes")
+                                print(f"   Duration: {duration:.2f}s")
+                                print(f"   Format: 24kHz mono PCM16")
                                 print(f"   Saved to: {output_file}")
                                 print(f"\n🔊 Play response:")
                                 print(f"   ffplay {output_file}")

@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -7,6 +8,12 @@ from pydantic import BaseModel, constr
 
 from .config import Settings, get_settings
 from .realtime import RealtimeProxy
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG if os.getenv("LOG_LEVEL") == "DEBUG" else logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 
 
 class AudioChunk(BaseModel):

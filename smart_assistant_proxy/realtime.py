@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import numpy as np
-import opuslib
+import opuslib  # Still needed for non-streaming endpoint
 import websockets
 
 from .config import Settings, get_settings
@@ -146,12 +146,9 @@ class RealtimeProxy:
     async def _stream_openai_response(self, ws, session_id: str):
         """
         Async generator that streams OpenAI response chunks.
-        Yields newline-delimited JSON chunks containing Opus-encoded audio.
+        Yields newline-delimited JSON chunks containing base64-encoded PCM16 audio.
         """
         logger.info("Starting to stream response session=%s", session_id)
-
-        audio_chunks = []  # Collect PCM chunks from OpenAI
-        encoder = None  # Opus encoder (initialized on first chunk)
 
         try:
             async for message in ws:
@@ -172,76 +169,24 @@ class RealtimeProxy:
                     if transcript:
                         logger.info("Input transcript: %s", transcript)
 
-                # Stream response audio as it arrives
+                # Stream response audio as it arrives (already PCM16 from OpenAI)
                 elif event_type == "response.audio.delta":
+                    logger.info("Audio delta event keys: %s", list(event.keys()))
                     audio_delta_b64 = event.get("delta", "")
+                    if not audio_delta_b64:
+                        logger.warning("Empty delta field, checking 'audio' field")
+                        audio_delta_b64 = event.get("audio", "")
                     if audio_delta_b64:
-                        # Decode PCM chunk from OpenAI
-                        pcm_chunk = base64.b64decode(audio_delta_b64)
-                        audio_chunks.append(pcm_chunk)
-                        logger.info("Received audio delta: %d bytes PCM", len(pcm_chunk))
-
-                        # Initialize Opus encoder on first chunk
-                        if encoder is None:
-                            encoder = opuslib.Encoder(24000, 1, opuslib.APPLICATION_VOIP)
-                            logger.info("Initialized Opus encoder for streaming")
-
-                        # Encode to Opus and stream immediately
-                        # Note: We accumulate small PCM chunks until we have a full Opus frame (20ms = 960 bytes)
-                        combined = b"".join(audio_chunks)
-                        frame_bytes = 960  # 20ms at 24kHz = 480 samples * 2 bytes
-
-                        while len(combined) >= frame_bytes:
-                            frame = combined[:frame_bytes]
-                            combined = combined[frame_bytes:]
-
-                            try:
-                                opus_frame = encoder.encode(frame, 480)
-
-                                # Add self-delimited length prefix (RFC 6716 Appendix B)
-                                frame_len = len(opus_frame)
-                                if frame_len < 252:
-                                    delimited_frame = bytes([frame_len]) + opus_frame
-                                else:
-                                    delimited_frame = bytes([252, frame_len - 252]) + opus_frame
-
-                                # Encode to base64 and yield as JSON chunk
-                                opus_b64 = base64.b64encode(delimited_frame).decode()
-                                logger.info("Yielding Opus frame: %d bytes", len(delimited_frame))
-                                yield json.dumps({"audio_delta": opus_b64}) + "\n"
-
-                            except Exception as e:
-                                logger.error("Failed to encode Opus frame: %s", e)
-
-                        # Keep remaining partial frame for next iteration
-                        audio_chunks = [combined] if combined else []
+                        # OpenAI sends PCM16 at 24kHz - stream it directly to device
+                        # No encoding needed - just forward the base64 PCM
+                        logger.info("Streaming PCM delta: %d bytes (base64)", len(audio_delta_b64))
+                        yield json.dumps({"audio_delta": audio_delta_b64}) + "\n"
+                    else:
+                        logger.error("Audio delta event has no audio data! Event: %s", event)
 
                 # Response complete
                 elif event_type == "response.done":
                     logger.info("Response completed session=%s", session_id)
-
-                    # Encode any remaining partial frame
-                    if audio_chunks and encoder:
-                        remaining = b"".join(audio_chunks)
-                        if remaining:
-                            # Pad to full frame size
-                            frame_bytes = 960
-                            if len(remaining) < frame_bytes:
-                                remaining = remaining + b'\x00' * (frame_bytes - len(remaining))
-
-                            try:
-                                opus_frame = encoder.encode(remaining[:frame_bytes], 480)
-                                frame_len = len(opus_frame)
-                                if frame_len < 252:
-                                    delimited_frame = bytes([frame_len]) + opus_frame
-                                else:
-                                    delimited_frame = bytes([252, frame_len - 252]) + opus_frame
-
-                                opus_b64 = base64.b64encode(delimited_frame).decode()
-                                yield json.dumps({"audio_delta": opus_b64}) + "\n"
-                            except Exception as e:
-                                logger.error("Failed to encode final Opus frame: %s", e)
-
                     # Send completion marker
                     yield json.dumps({"status": "complete"}) + "\n"
                     break
