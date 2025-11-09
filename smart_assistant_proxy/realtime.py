@@ -59,7 +59,7 @@ class RealtimeProxy:
                         "output_audio_format": "pcm16",
                         "input_audio_transcription": {"model": "whisper-1"},
                         "turn_detection": None,  # Disable server VAD
-                        "max_response_output_tokens": 500,
+                        "max_response_output_tokens": 4096,  # Allow longer responses
                     },
                 }
                 await self._openai_ws.send(json.dumps(session_update))
