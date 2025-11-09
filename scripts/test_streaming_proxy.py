@@ -165,10 +165,14 @@ async def test_streaming_proxy(
 
                         # Decode and save audio
                         if response_chunks:
-                            audio_b64 = "".join(c.get("audio_delta", "") for c in response_chunks)
+                            # Decode each chunk's base64 separately, then join the bytes
+                            audio_bytes = b"".join(
+                                base64.b64decode(c.get("audio_delta", ""))
+                                for c in response_chunks
+                                if c.get("audio_delta")
+                            )
 
-                            if audio_b64:
-                                audio_bytes = base64.b64decode(audio_b64)
+                            if audio_bytes:
 
                                 output_file = "response.opus"
                                 with open(output_file, "wb") as f:
