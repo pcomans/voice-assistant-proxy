@@ -158,7 +158,7 @@ class RealtimeProxy:
                 event = json.loads(message)
                 event_type = event.get("type")
 
-                logger.debug("Received event: %s", event_type)
+                logger.info("Received event: %s", event_type)
 
                 if event_type == "error":
                     error_detail = event.get("error", {})
@@ -179,6 +179,7 @@ class RealtimeProxy:
                         # Decode PCM chunk from OpenAI
                         pcm_chunk = base64.b64decode(audio_delta_b64)
                         audio_chunks.append(pcm_chunk)
+                        logger.info("Received audio delta: %d bytes PCM", len(pcm_chunk))
 
                         # Initialize Opus encoder on first chunk
                         if encoder is None:
@@ -206,6 +207,7 @@ class RealtimeProxy:
 
                                 # Encode to base64 and yield as JSON chunk
                                 opus_b64 = base64.b64encode(delimited_frame).decode()
+                                logger.info("Yielding Opus frame: %d bytes", len(delimited_frame))
                                 yield json.dumps({"audio_delta": opus_b64}) + "\n"
 
                             except Exception as e:
