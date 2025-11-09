@@ -1,3 +1,11 @@
 .env
 smart_assistant_proxy/__pycache__/
-response.opus
+tests/__pycache__/
+
+# Coverage reports
+.coverage
+htmlcov/
+
+# Audio files
+*.wav
+*.opus
