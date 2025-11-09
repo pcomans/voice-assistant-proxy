@@ -9,3 +9,4 @@ htmlcov/
 # Audio files
 *.wav
 *.opus
+.DS_Store
