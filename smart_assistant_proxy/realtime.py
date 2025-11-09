@@ -89,8 +89,6 @@ class RealtimeProxy:
 
         # Decode PCM and resample to 24kHz (OpenAI requirement)
         pcm_chunk = base64.b64decode(pcm_b64)
-        resampled_chunk = self._resample_audio(pcm_chunk, 16000, 24000)
-        resampled_b64 = base64.b64encode(resampled_chunk).decode("utf-8")
 
         # Get persistent WebSocket connection
         try:
@@ -99,25 +97,32 @@ class RealtimeProxy:
             logger.exception("Failed to connect to OpenAI")
             raise
 
-        # Forward chunk to OpenAI immediately (KEY CHANGE: don't accumulate!)
-        async with self._ws_lock:
-            try:
-                await ws.send(json.dumps({
-                    "type": "input_audio_buffer.append",
-                    "audio": resampled_b64
-                }))
-                logger.info(
-                    "Forwarded chunk session=%s idx=%d final=%s bytes=%d",
-                    session_id,
-                    chunk_index,
-                    is_final,
-                    len(pcm_chunk)
-                )
-            except Exception as exc:
-                logger.exception("Failed to send chunk to OpenAI")
-                # Connection might be dead, clear it
-                self._openai_ws = None
-                raise
+        # Skip resampling and forwarding for empty chunks (final empty chunk signals end)
+        if len(pcm_chunk) > 0:
+            resampled_chunk = self._resample_audio(pcm_chunk, 16000, 24000)
+            resampled_b64 = base64.b64encode(resampled_chunk).decode("utf-8")
+
+            # Forward chunk to OpenAI immediately (KEY CHANGE: don't accumulate!)
+            async with self._ws_lock:
+                try:
+                    await ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": resampled_b64
+                    }))
+                    logger.info(
+                        "Forwarded chunk session=%s idx=%d final=%s bytes=%d",
+                        session_id,
+                        chunk_index,
+                        is_final,
+                        len(pcm_chunk)
+                    )
+                except Exception as exc:
+                    logger.exception("Failed to send chunk to OpenAI")
+                    # Connection might be dead, clear it
+                    self._openai_ws = None
+                    raise
+        else:
+            logger.info("Skipping empty final chunk session=%s idx=%d", session_id, chunk_index)
 
         # If not final, return quick acknowledgment
         if not is_final:
@@ -146,7 +151,7 @@ class RealtimeProxy:
     async def _stream_openai_response(self, ws, session_id: str):
         """
         Async generator that streams OpenAI response chunks.
-        Yields newline-delimited JSON chunks containing base64-encoded PCM16 audio.
+        Yields raw PCM16 audio bytes (no JSON, no base64) for efficient streaming.
         """
         logger.info("Starting to stream response session=%s", session_id)
 
@@ -160,7 +165,7 @@ class RealtimeProxy:
                 if event_type == "error":
                     error_detail = event.get("error", {})
                     logger.error("OpenAI Realtime API error: %s", error_detail)
-                    yield json.dumps({"error": error_detail.get("message", "Unknown error")}) + "\n"
+                    # Error: send zero-length chunk to signal error
                     break
 
                 # Collect input transcription
@@ -171,29 +176,28 @@ class RealtimeProxy:
 
                 # Stream response audio as it arrives (already PCM16 from OpenAI)
                 elif event_type == "response.audio.delta":
-                    logger.info("Audio delta event keys: %s", list(event.keys()))
                     audio_delta_b64 = event.get("delta", "")
                     if not audio_delta_b64:
                         logger.warning("Empty delta field, checking 'audio' field")
                         audio_delta_b64 = event.get("audio", "")
                     if audio_delta_b64:
-                        # OpenAI sends PCM16 at 24kHz - stream it directly to device
-                        # No encoding needed - just forward the base64 PCM
-                        logger.info("Streaming PCM delta: %d bytes (base64)", len(audio_delta_b64))
-                        yield json.dumps({"audio_delta": audio_delta_b64}) + "\n"
+                        # Decode base64 to raw PCM bytes and stream directly
+                        import base64
+                        pcm_bytes = base64.b64decode(audio_delta_b64)
+                        logger.info("Streaming raw PCM delta: %d bytes", len(pcm_bytes))
+                        yield pcm_bytes
                     else:
                         logger.error("Audio delta event has no audio data! Event: %s", event)
 
                 # Response complete
                 elif event_type == "response.done":
                     logger.info("Response completed session=%s", session_id)
-                    # Send completion marker
-                    yield json.dumps({"status": "complete"}) + "\n"
+                    # No completion marker needed - HTTP stream ends naturally
                     break
 
         except Exception as exc:
             logger.exception("Error streaming response session=%s", session_id)
-            yield json.dumps({"error": str(exc)}) + "\n"
+            # Error: stream ends
 
     def _resample_audio(self, pcm_bytes: bytes, input_rate: int, output_rate: int) -> bytes:
         """Resample PCM16 audio from input_rate to output_rate."""

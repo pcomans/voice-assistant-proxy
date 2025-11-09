@@ -19,7 +19,7 @@ logging.basicConfig(
 class AudioChunk(BaseModel):
     session_id: constr(min_length=1)
     chunk_index: int
-    pcm_base64: constr(min_length=1)
+    pcm_base64: str  # Allow empty for final chunks with 0 bytes
     is_final: bool = False
 
 
@@ -72,7 +72,7 @@ async def post_audio(
         logger.info("Returning streaming response session=%s", chunk.session_id)
         return StreamingResponse(
             result,
-            media_type="application/x-ndjson",  # Newline-delimited JSON
+            media_type="application/octet-stream",  # Raw PCM binary stream
             headers={
                 "X-Session-ID": chunk.session_id,
                 "Cache-Control": "no-cache",
