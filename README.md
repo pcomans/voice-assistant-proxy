@@ -257,6 +257,7 @@ pyproject.toml      # Python dependencies and project metadata
 
 ### Run tests
 
+**Run all unit tests:**
 ```bash
 poetry run pytest
 ```
@@ -271,6 +272,22 @@ View coverage report:
 open htmlcov/index.html  # macOS
 xdg-open htmlcov/index.html  # Linux
 ```
+
+**Run integration tests:**
+
+Integration tests require a valid OpenAI API key and make actual calls to OpenAI's live API. They are skipped by default.
+
+To run integration tests:
+```bash
+RUN_INTEGRATION_TESTS=1 poetry run pytest -m integration
+```
+
+Or run all tests including integration:
+```bash
+RUN_INTEGRATION_TESTS=1 poetry run pytest
+```
+
+**Note:** Integration tests will incur OpenAI API costs and require the proxy to successfully connect to OpenAI's Realtime API.
 
 ### Code style
 

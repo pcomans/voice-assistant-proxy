@@ -1,6 +1,7 @@
 """Integration tests for streaming proxy (Option C)."""
 import base64
 import json
+import os
 
 import pytest
 
@@ -8,8 +9,8 @@ import pytest
 @pytest.mark.asyncio
 @pytest.mark.integration
 @pytest.mark.skipif(
-    condition=True,  # Skip by default (requires OpenAI API key)
-    reason="Integration test requires OpenAI API key and live service"
+    condition=not os.getenv("RUN_INTEGRATION_TESTS"),
+    reason="Integration test requires OpenAI API key and live service. Set RUN_INTEGRATION_TESTS=1 to run."
 )
 async def test_streaming_response_with_real_audio(client, auth_headers, real_audio_pcm):
     """Test full streaming flow with real audio.
@@ -36,7 +37,7 @@ async def test_streaming_response_with_real_audio(client, auth_headers, real_aud
     assert response.status_code == 200
     assert response.json()["status"] == "partial"
 
-    # Send final chunk and get streaming response
+    # Send final chunk and get streaming response (raw binary PCM)
     with client.stream(
         "POST",
         "/v1/audio",
@@ -49,35 +50,25 @@ async def test_streaming_response_with_real_audio(client, auth_headers, real_aud
         headers=auth_headers
     ) as response:
         assert response.status_code == 200
-        assert response.headers["content-type"] == "application/x-ndjson"
+        assert response.headers["content-type"] == "application/octet-stream"
 
-        audio_chunks = 0
-        status_chunks = 0
         total_audio_bytes = 0
 
-        # Collect streaming response
-        for line in response.iter_lines():
-            if line.strip():
-                data = json.loads(line)
-
-                if "audio_delta" in data:
-                    audio_chunks += 1
-                    pcm_bytes = base64.b64decode(data["audio_delta"])
-                    total_audio_bytes += len(pcm_bytes)
-
-                elif "status" in data:
-                    status_chunks += 1
-                    assert data["status"] == "complete"
+        # Collect streaming binary PCM response
+        for chunk in response.iter_bytes():
+            if chunk:
+                total_audio_bytes += len(chunk)
 
         # Verify we got audio response
-        assert audio_chunks > 0, "Should receive audio chunks"
-        assert status_chunks == 1, "Should receive exactly one completion status"
         assert total_audio_bytes > 0, "Should receive non-empty audio data"
 
+        # Audio should be 24kHz 16-bit PCM mono (2 bytes per sample)
+        # Verify it's a reasonable size (at least 1 second = 48000 bytes)
+        assert total_audio_bytes >= 48000, f"Audio seems too short: {total_audio_bytes} bytes"
+
         print(f"\nIntegration test results:")
-        print(f"  Audio chunks: {audio_chunks}")
         print(f"  Total audio bytes: {total_audio_bytes}")
-        print(f"  Status chunks: {status_chunks}")
+        print(f"  Duration (approx): {total_audio_bytes / 48000:.2f} seconds")
 
 
 @pytest.mark.unit
