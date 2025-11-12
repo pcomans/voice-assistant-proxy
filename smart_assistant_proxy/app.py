@@ -144,11 +144,11 @@ async def forward_device_to_openai(device_ws: WebSocket, openai_ws):
     """Forward audio from device to OpenAI with manual turn detection"""
     import base64
     import numpy as np
+    import time
 
     try:
         audio_chunks_received = 0
         last_audio_time = None
-        import time
 
         while True:
             # Receive raw PCM from device (16kHz, 16-bit)
