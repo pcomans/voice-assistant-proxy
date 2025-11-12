@@ -2,7 +2,7 @@ import json
 import logging
 import os
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, constr
 
@@ -87,3 +87,151 @@ async def post_audio(
     )
 
     return result
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for bidirectional audio streaming with OpenAI Realtime API.
+
+    - Receives: Raw binary PCM audio from device (16-bit PCM, 16kHz)
+    - Sends: Raw binary PCM audio to device (16-bit PCM, 24kHz from OpenAI)
+    """
+    await websocket.accept()
+    logger.info("WebSocket connection established from client")
+
+    # Get or create OpenAI connection
+    try:
+        openai_ws = await proxy_instance.get_openai_connection()
+        logger.info("OpenAI Realtime API connection ready")
+    except Exception as e:
+        logger.exception("Failed to connect to OpenAI: %s", e)
+        await websocket.close(code=1011, reason="OpenAI connection failed")
+        return
+
+    try:
+        # Start concurrent tasks for bidirectional streaming
+        import asyncio
+        receive_task = asyncio.create_task(forward_device_to_openai(websocket, openai_ws))
+        send_task = asyncio.create_task(forward_openai_to_device(websocket, openai_ws))
+
+        # Wait for either task to complete (disconnection or error)
+        done, pending = await asyncio.wait(
+            [receive_task, send_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # Cancel remaining task
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.exception("WebSocket error: %s", e)
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
+
+
+async def forward_device_to_openai(device_ws: WebSocket, openai_ws):
+    """Forward audio from device to OpenAI with manual turn detection"""
+    import base64
+    import numpy as np
+
+    try:
+        audio_chunks_received = 0
+        last_audio_time = None
+        import time
+
+        while True:
+            # Receive raw PCM from device (16kHz, 16-bit)
+            data = await device_ws.receive_bytes()
+
+            if len(data) == 0:
+                # Empty frame signals end of recording - commit and request response
+                if audio_chunks_received > 0:
+                    logger.info(f"End of recording detected ({audio_chunks_received} chunks), committing audio and requesting response")
+
+                    # Commit the audio buffer
+                    await openai_ws.send(json.dumps({
+                        "type": "input_audio_buffer.commit"
+                    }))
+
+                    # Request a response
+                    await openai_ws.send(json.dumps({
+                        "type": "response.create"
+                    }))
+
+                    audio_chunks_received = 0
+                    last_audio_time = None
+                continue
+
+            logger.info(f"Received {len(data)} bytes from device")
+
+            # Track timing for timeout detection
+            current_time = time.time()
+            if last_audio_time and (current_time - last_audio_time) > 2.0:
+                # Gap detected - might be end of turn
+                if audio_chunks_received > 0:
+                    logger.info(f"Audio gap detected (>2s), committing and requesting response")
+                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                    await openai_ws.send(json.dumps({"type": "response.create"}))
+                    audio_chunks_received = 0
+
+            last_audio_time = current_time
+
+            # Resample 16kHz → 24kHz for OpenAI
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            input_length = len(audio_data)
+            output_length = int(input_length * 24000 / 16000)
+            input_indices = np.linspace(0, input_length - 1, output_length)
+            resampled = np.interp(input_indices, np.arange(input_length), audio_data).astype(np.int16)
+            resampled_b64 = base64.b64encode(resampled.tobytes()).decode("utf-8")
+
+            # Forward to OpenAI
+            await openai_ws.send(json.dumps({
+                "type": "input_audio_buffer.append",
+                "audio": resampled_b64
+            }))
+            audio_chunks_received += 1
+            logger.info(f"Forwarded {len(data)} bytes to OpenAI (chunk {audio_chunks_received})")
+    except Exception as e:
+        logger.exception(f"Error in forward_device_to_openai: {e}")
+        raise
+
+
+async def forward_openai_to_device(device_ws: WebSocket, openai_ws):
+    """Forward audio responses from OpenAI to device"""
+    import base64
+
+    async for message in openai_ws:
+        event = json.loads(message)
+        event_type = event.get("type")
+
+        logger.info(f"OpenAI event: {event_type}")
+
+        # Forward audio deltas from OpenAI to device
+        if event_type == "response.audio.delta":
+            audio_delta_b64 = event.get("delta", "") or event.get("audio", "")
+            if audio_delta_b64:
+                pcm_bytes = base64.b64decode(audio_delta_b64)
+                await device_ws.send_bytes(pcm_bytes)
+                logger.info(f"Sent {len(pcm_bytes)} bytes to device")
+
+        # Log transcripts
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            transcript = event.get("transcript", "")
+            if transcript:
+                logger.info(f"User said: {transcript}")
+
+        # Log errors
+        elif event_type == "error":
+            error_detail = event.get("error", {})
+            logger.error(f"OpenAI error: {error_detail}")
