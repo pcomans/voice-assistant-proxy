@@ -1,7 +1,10 @@
 import json
 import logging
 import os
+import time
+from dataclasses import dataclass, field
 
+import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, constr
@@ -24,9 +27,36 @@ class AudioChunk(BaseModel):
     is_final: bool = False
 
 
+@dataclass
+class SessionState:
+    last_activity_time: float = field(default_factory=time.time)
+
+
+
 app = FastAPI(title="Smart Assistant Proxy", version="0.1.0")
 proxy_instance = RealtimeProxy()
 logger = logging.getLogger(__name__)
+
+
+def generate_beep(duration_ms: int = 200, frequency: int = 800, sample_rate: int = 24000) -> bytes:
+    """Generate a simple sine wave beep at 24kHz 16-bit PCM (OpenAI Realtime API format)"""
+    import numpy as np
+
+    duration_sec = duration_ms / 1000.0
+    num_samples = int(sample_rate * duration_sec)
+    t = np.linspace(0, duration_sec, num_samples, False)
+
+    # Generate sine wave with envelope to avoid clicks
+    sine_wave = np.sin(2 * np.pi * frequency * t)
+
+    # Apply fade in/out envelope
+    fade_samples = int(sample_rate * 0.01)  # 10ms fade
+    envelope = np.ones(num_samples)
+    envelope[:fade_samples] = np.linspace(0, 1, fade_samples)
+    envelope[-fade_samples:] = np.linspace(1, 0, fade_samples)
+
+    audio = (sine_wave * envelope * 32767 * 0.3).astype(np.int16)  # 30% volume
+    return audio.tobytes()
 
 
 @app.get("/healthz")
@@ -154,18 +184,22 @@ async def websocket_endpoint(websocket: WebSocket):
         return
 
     try:
+        # Initialize session state for silence timeout
+        session_state = SessionState()
+
         # Start concurrent tasks for bidirectional streaming
         import asyncio
         receive_task = asyncio.create_task(forward_device_to_openai(websocket, openai_ws))
-        send_task = asyncio.create_task(forward_openai_to_device(websocket, openai_ws))
+        send_task = asyncio.create_task(forward_openai_to_device(websocket, openai_ws, session_state))
+        watchdog = asyncio.create_task(watchdog_task(websocket, session_state))
 
         # Wait for either task to complete (disconnection or error)
         done, pending = await asyncio.wait(
-            [receive_task, send_task],
+            [receive_task, send_task, watchdog],
             return_when=asyncio.FIRST_COMPLETED
         )
 
-        # Cancel remaining task
+        # Cancel remaining tasks
         for task in pending:
             task.cancel()
             try:
@@ -183,13 +217,13 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 await openai_ws.close()
                 logger.info("Closed OpenAI WebSocket")
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"OpenAI WebSocket already closed: {e}")
 
         try:
             await websocket.close()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Device WebSocket already closed: {e}")
 
 
 async def forward_device_to_openai(device_ws: WebSocket, openai_ws):
@@ -227,36 +261,99 @@ async def forward_device_to_openai(device_ws: WebSocket, openai_ws):
             # Log occasionally to avoid spam
             if audio_chunks_received % 50 == 0:
                 logger.info(f"Forwarded {audio_chunks_received} chunks to OpenAI")
+    except WebSocketDisconnect:
+        logger.info("Device disconnected from forward_device_to_openai")
+    except RuntimeError as e:
+        if "WebSocket is not connected" in str(e):
+            logger.info("WebSocket closed (likely by watchdog timeout)")
+        else:
+            logger.exception(f"Runtime error in forward_device_to_openai: {e}")
+            raise
     except Exception as e:
         logger.exception(f"Error in forward_device_to_openai: {e}")
         raise
 
 
-async def forward_openai_to_device(device_ws: WebSocket, openai_ws):
+async def watchdog_task(websocket: WebSocket, session_state: SessionState):
+    """Monitor session activity and close connection if silent for too long."""
+    import asyncio
+    try:
+        while True:
+            await asyncio.sleep(1.0)
+            if time.time() - session_state.last_activity_time > 20.0:
+                logger.info("Session timed out due to silence (20s)")
+
+                # Send a short beep notification before closing
+                try:
+                    beep_audio = generate_beep(duration_ms=200, frequency=800)
+                    await websocket.send_bytes(beep_audio)
+                    logger.info("Sent timeout beep notification to device")
+                    await asyncio.sleep(0.3)  # Give time for beep to play
+                except Exception as e:
+                    logger.warning(f"Failed to send timeout beep: {e}")
+
+                await websocket.close(code=1000, reason="Silence timeout")
+                break
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.exception(f"Watchdog error: {e}")
+
+
+async def forward_openai_to_device(device_ws: WebSocket, openai_ws, session_state: SessionState):
     """Forward audio responses from OpenAI to device"""
     import base64
 
-    async for message in openai_ws:
-        event = json.loads(message)
-        event_type = event.get("type")
+    try:
+        async for message in openai_ws:
+            # Update activity on any message from OpenAI (keeps connection alive during interaction)
+            # We can refine this to specific events if needed, but any activity from agent is good.
+            # Actually, we want to timeout if *silence* (no audio/speech).
+            # But if OpenAI is sending events, the agent is likely "responding" or processing.
+            # Let's be specific to audio/speech events to be safe, or just update on any event?
+            # If we update on any event, then as long as OpenAI sends heartbeats or keepalives (if any), it won't timeout.
+            # But OpenAI Realtime API is event driven.
 
-        logger.info(f"OpenAI event: {event_type}")
+            event = json.loads(message)
+            event_type = event.get("type")
 
-        # Forward audio deltas from OpenAI to device
-        if event_type == "response.audio.delta":
-            audio_delta_b64 = event.get("delta", "") or event.get("audio", "")
-            if audio_delta_b64:
-                pcm_bytes = base64.b64decode(audio_delta_b64)
-                await device_ws.send_bytes(pcm_bytes)
-                logger.info(f"Sent {len(pcm_bytes)} bytes to device")
+            # Update activity time for relevant events
+            if event_type in [
+                "response.audio.delta",
+                "response.done",
+                "input_audio_buffer.speech_started",
+                "input_audio_buffer.speech_stopped"
+            ]:
+                session_state.last_activity_time = time.time()
 
-        # Log transcripts
-        elif event_type == "conversation.item.input_audio_transcription.completed":
-            transcript = event.get("transcript", "")
-            if transcript:
-                logger.info(f"User said: {transcript}")
+            logger.info(f"OpenAI event: {event_type}")
 
-        # Log errors
-        elif event_type == "error":
-            error_detail = event.get("error", {})
-            logger.error(f"OpenAI error: {error_detail}")
+            # Forward audio deltas from OpenAI to device
+            if event_type == "response.audio.delta":
+                audio_delta_b64 = event.get("delta", "") or event.get("audio", "")
+                if audio_delta_b64:
+                    pcm_bytes = base64.b64decode(audio_delta_b64)
+                    await device_ws.send_bytes(pcm_bytes)
+                    logger.info(f"Sent {len(pcm_bytes)} bytes to device")
+
+            # Log transcripts
+            elif event_type == "conversation.item.input_audio_transcription.completed":
+                transcript = event.get("transcript", "")
+                if transcript:
+                    logger.info(f"User said: {transcript}")
+
+            # Log errors
+            elif event_type == "error":
+                error_detail = event.get("error", {})
+                logger.error(f"OpenAI error: {error_detail}")
+    except WebSocketDisconnect:
+        logger.info("Device disconnected from forward_openai_to_device")
+    except RuntimeError as e:
+        if "WebSocket is not connected" in str(e):
+            logger.info("WebSocket closed during forward_openai_to_device (likely by watchdog)")
+        else:
+            logger.exception(f"Runtime error in forward_openai_to_device: {e}")
+            raise
+    except Exception as e:
+        logger.exception(f"Error in forward_openai_to_device: {e}")
+        raise
